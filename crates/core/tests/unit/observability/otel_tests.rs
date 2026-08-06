@@ -2093,6 +2093,168 @@ fn gen_ai_projection_covers_optional_request_controls_and_finish_reasons() {
 }
 
 #[test]
+fn gen_ai_projection_projects_input_messages_and_system_instructions() {
+    let request = Event::Scope(ScopeEvent::new(
+        BaseEvent::builder()
+            .uuid(Uuid::now_v7())
+            .name("anthropic.messages")
+            .data(json!({
+                "headers": {},
+                "content": {
+                    "model": "claude-sonnet",
+                    "max_tokens": 100,
+                    "system": "be concise",
+                    "messages": [
+                        {"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": "hi, how can I help?"}
+                    ]
+                }
+            }))
+            .build(),
+        ScopeCategory::Start,
+        Vec::new(),
+        EventCategory::llm(),
+        None,
+    ));
+    let attributes = attr_map(&crate::observability::otel_genai::start_attributes(
+        &request,
+    ));
+    assert_eq!(
+        attributes.get("gen_ai.system_instructions"),
+        Some(&json!([{"type": "text", "content": "be concise"}]).to_string())
+    );
+    assert_eq!(
+        attributes.get("gen_ai.input.messages"),
+        Some(
+            &json!([
+                {"role": "user", "parts": [{"type": "text", "content": "hello"}]},
+                {"role": "assistant", "parts": [{"type": "text", "content": "hi, how can I help?"}]}
+            ])
+            .to_string()
+        )
+    );
+}
+
+#[test]
+fn gen_ai_projection_projects_tool_interactions_in_input_messages() {
+    let request = Event::Scope(ScopeEvent::new(
+        BaseEvent::builder()
+            .uuid(Uuid::now_v7())
+            .name("openai.chat")
+            .data(json!({
+                "headers": {},
+                "content": {
+                    "model": "gpt-5",
+                    "messages": [
+                        {"role": "user", "content": "weather?"},
+                        {"role": "assistant", "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": "{\"city\":\"sf\"}"}
+                        }]},
+                        {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+                    ]
+                }
+            }))
+            .build(),
+        ScopeCategory::Start,
+        Vec::new(),
+        EventCategory::llm(),
+        None,
+    ));
+    let attributes = attr_map(&crate::observability::otel_genai::start_attributes(
+        &request,
+    ));
+    assert_eq!(
+        attributes.get("gen_ai.input.messages"),
+        Some(
+            &json!([
+                {"role": "user", "parts": [{"type": "text", "content": "weather?"}]},
+                {"role": "assistant", "parts": [{
+                    "type": "tool_call",
+                    "id": "call_1",
+                    "name": "get_weather",
+                    "arguments": {"city": "sf"}
+                }]},
+                {"role": "tool", "parts": [{
+                    "type": "tool_call_response",
+                    "id": "call_1",
+                    "response": "sunny"
+                }]}
+            ])
+            .to_string()
+        )
+    );
+}
+
+#[test]
+fn gen_ai_projection_projects_output_messages() {
+    let event = make_scope_event_with_profile(
+        ScopeCategory::End,
+        Uuid::now_v7(),
+        None,
+        "chat",
+        ScopeType::Llm,
+        None,
+        Some(
+            CategoryProfile::builder()
+                .annotated_response(Arc::new(AnnotatedLlmResponse {
+                    message: Some(crate::codec::request::MessageContent::Text(
+                        "hi there".to_string(),
+                    )),
+                    tool_calls: Some(vec![crate::codec::response::ResponseToolCall {
+                        id: "call_1".to_string(),
+                        name: "get_weather".to_string(),
+                        arguments: json!({"city": "sf"}),
+                    }]),
+                    finish_reason: Some(FinishReason::Complete),
+                    ..empty_annotated_response()
+                }))
+                .build(),
+        ),
+    );
+    let attributes = attr_map(&crate::observability::otel_genai::end_attributes(&event));
+    assert_eq!(
+        attributes.get("gen_ai.output.messages"),
+        Some(
+            &json!([{
+                "role": "assistant",
+                "parts": [
+                    {"type": "text", "content": "hi there"},
+                    {"type": "tool_call", "id": "call_1", "name": "get_weather", "arguments": {"city": "sf"}}
+                ],
+                "finish_reason": "stop"
+            }])
+            .to_string()
+        )
+    );
+}
+
+#[test]
+fn gen_ai_projection_omits_message_content_attributes_without_content() {
+    let start = make_start_event(Uuid::now_v7(), None, "chat", ScopeType::Llm, None);
+    let attributes = attr_map(&crate::observability::otel_genai::start_attributes(&start));
+    assert!(!attributes.contains_key("gen_ai.input.messages"));
+    assert!(!attributes.contains_key("gen_ai.system_instructions"));
+
+    let end = make_scope_event_with_profile(
+        ScopeCategory::End,
+        Uuid::now_v7(),
+        None,
+        "chat",
+        ScopeType::Llm,
+        None,
+        Some(
+            CategoryProfile::builder()
+                .annotated_response(Arc::new(empty_annotated_response()))
+                .build(),
+        ),
+    );
+    let attributes = attr_map(&crate::observability::otel_genai::end_attributes(&end));
+    assert!(!attributes.contains_key("gen_ai.output.messages"));
+}
+
+#[test]
 fn gen_ai_projection_reads_nested_scalar_fallbacks() {
     let event = Event::Scope(ScopeEvent::new(
         BaseEvent::builder()

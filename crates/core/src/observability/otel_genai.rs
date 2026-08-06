@@ -7,12 +7,13 @@
 
 use crate::api::event::{Event, EventNormalizationExt};
 use crate::api::scope::ScopeType;
-use crate::codec::request::ApiSpecificRequest;
+use crate::codec::request::{ApiSpecificRequest, ContentPart, Message, MessageContent, ToolCall};
 use crate::codec::response::FinishReason;
 use crate::json::Json;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::SpanKind;
 use opentelemetry_semantic_conventions::attribute as semconv;
+use serde_json::json;
 use serde_json::{Map, Value};
 
 const OPERATION_CHAT: &str = "chat";
@@ -225,7 +226,151 @@ fn push_llm_request_attributes(attributes: &mut Vec<KeyValue>, event: &Event) {
     if request.stream == Some(true) {
         attributes.push(KeyValue::new("gen_ai.request.stream", true));
     }
+    if let Some(instructions) = request.instructions.as_ref() {
+        let parts = message_content_parts(instructions);
+        if !parts.is_empty() {
+            attributes.push(KeyValue::new(
+                semconv::GEN_AI_SYSTEM_INSTRUCTIONS,
+                Value::Array(parts).to_string(),
+            ));
+        }
+    }
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .filter_map(input_message_value)
+        .collect();
+    if !messages.is_empty() {
+        attributes.push(KeyValue::new(
+            semconv::GEN_AI_INPUT_MESSAGES,
+            Value::Array(messages).to_string(),
+        ));
+    }
     push_api_specific_request_attributes(attributes, request.api_specific.as_ref());
+}
+
+fn input_message_value(message: &Message) -> Option<Value> {
+    let (role, parts) = match message {
+        Message::System { content, .. } | Message::Developer { content, .. } => {
+            ("system", message_content_parts(content))
+        }
+        Message::User { content, .. } => ("user", message_content_parts(content)),
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
+            let mut parts = content
+                .as_ref()
+                .map(message_content_parts)
+                .unwrap_or_default();
+            if let Some(calls) = tool_calls.as_ref() {
+                parts.extend(calls.iter().map(request_tool_call_part));
+            }
+            ("assistant", parts)
+        }
+        Message::Tool {
+            content,
+            tool_call_id,
+        } => (
+            "tool",
+            vec![tool_call_response_part(
+                Some(tool_call_id.as_str()),
+                message_content_value(content),
+            )],
+        ),
+        Message::Function { content, .. } => (
+            "tool",
+            vec![tool_call_response_part(
+                None,
+                content.clone().map(Value::String).unwrap_or(Value::Null),
+            )],
+        ),
+        Message::ToolCallItem {
+            call_id,
+            name,
+            arguments,
+            ..
+        } => (
+            "assistant",
+            vec![tool_call_part(call_id, name, arguments.clone())],
+        ),
+        Message::ToolResultItem {
+            call_id, output, ..
+        } => (
+            "tool",
+            vec![tool_call_response_part(
+                Some(call_id.as_str()),
+                output.clone(),
+            )],
+        ),
+        Message::ProviderNative { .. } => return None,
+    };
+    if parts.is_empty() {
+        return None;
+    }
+    Some(json!({"role": role, "parts": parts}))
+}
+
+fn message_content_parts(content: &MessageContent) -> Vec<Value> {
+    match content {
+        MessageContent::Text(text) => vec![text_part(text)],
+        MessageContent::Parts(parts) => parts.iter().map(content_part_value).collect(),
+    }
+}
+
+fn content_part_value(part: &ContentPart) -> Value {
+    match part {
+        ContentPart::Text { text, .. } => text_part(text),
+        ContentPart::Refusal { refusal, .. } => text_part(refusal),
+        ContentPart::ToolUse {
+            id, name, input, ..
+        } => tool_call_part(id, name, input.clone()),
+        ContentPart::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => tool_call_response_part(Some(tool_use_id.as_str()), content.clone()),
+        // Media and provider-native blocks already carry a `type` tag; export
+        // their normalized shape rather than inventing a lossy mapping.
+        other => serde_json::to_value(other).unwrap_or(Value::Null),
+    }
+}
+
+fn message_content_value(content: &MessageContent) -> Value {
+    match content {
+        MessageContent::Text(text) => Value::String(text.clone()),
+        MessageContent::Parts(_) => serde_json::to_value(content).unwrap_or(Value::Null),
+    }
+}
+
+fn text_part(text: &str) -> Value {
+    json!({"type": "text", "content": text})
+}
+
+fn tool_call_part(id: &str, name: &str, arguments: Json) -> Value {
+    json!({"type": "tool_call", "id": id, "name": name, "arguments": arguments})
+}
+
+fn request_tool_call_part(call: &ToolCall) -> Value {
+    // Request-side tool call arguments are a JSON string per the OpenAI
+    // convention; decode when possible so parts carry structured arguments.
+    let arguments = serde_json::from_str(&call.function.arguments)
+        .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
+    tool_call_part(&call.id, &call.function.name, arguments)
+}
+
+fn tool_call_response_part(id: Option<&str>, response: Value) -> Value {
+    let mut part = Map::new();
+    part.insert(
+        "type".to_string(),
+        Value::String("tool_call_response".to_string()),
+    );
+    if let Some(id) = id {
+        part.insert("id".to_string(), Value::String(id.to_string()));
+    }
+    part.insert("response".to_string(), response);
+    Value::Object(part)
 }
 
 fn push_api_specific_request_attributes(
@@ -301,6 +446,33 @@ fn push_llm_response_attributes(attributes: &mut Vec<KeyValue>, event: &Event) {
                 value,
             ));
         }
+    }
+    let mut parts = response
+        .message
+        .as_ref()
+        .map(message_content_parts)
+        .unwrap_or_default();
+    if let Some(calls) = response.tool_calls.as_ref() {
+        parts.extend(
+            calls
+                .iter()
+                .map(|call| tool_call_part(&call.id, &call.name, call.arguments.clone())),
+        );
+    }
+    if !parts.is_empty() {
+        let mut message = Map::new();
+        message.insert("role".to_string(), Value::String("assistant".to_string()));
+        message.insert("parts".to_string(), Value::Array(parts));
+        if let Some(value) = response.finish_reason.as_ref() {
+            message.insert(
+                "finish_reason".to_string(),
+                Value::String(finish_reason(value).to_string()),
+            );
+        }
+        attributes.push(KeyValue::new(
+            semconv::GEN_AI_OUTPUT_MESSAGES,
+            Value::Array(vec![Value::Object(message)]).to_string(),
+        ));
     }
 }
 
